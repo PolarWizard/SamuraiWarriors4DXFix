@@ -41,8 +41,8 @@
 // Local includes
 #include "utils.hpp"
 
-// Macros
-#define VERSION "0.0.0"
+// Version string
+constexpr std::string VERSION = "1.0.0";
 
 // .yml to struct
 typedef struct resolution_t {
