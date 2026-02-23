@@ -77,6 +77,9 @@ namespace {
 
     YAML::Node config = YAML::LoadFile("SamuraiWarriors4DXFix.yml");
     yml_t yml{};
+
+    std::atomic<bool> isCostumeView{false};
+    std::atomic<bool> inCutscene{false};
 }
 
 /**
@@ -269,6 +272,14 @@ void fixResolution() {
  * using the nameplates center point as a reference. In other words, the first pass fixes their position on the
  * screen and second pass fixes the spacing between characters caused by the first pass.
  *
+ * EDIT: A user found an issue that when the mini map is changed to its alternative, the rendering is not correct
+ * where it would either be partially rendered or not rendered at all. This was simple to fix, as we already know
+ * the game abuses the 1280.0f value for scaling, we just needed to find a place where this value is used for the
+ * mini map and then after experimenting I just needed to add in a large enough value and the alternative mini map
+ * would render correctly. This is what hook7 accomplishes. I can only assume that the larger value caused the
+ * clipping planes for the mini map to be further apart which is why the entire mini map would render properly, not
+ * that this has been confirmed but it is the most likely explanation.
+ *
  * @return void
  */
 void fixHud() {
@@ -302,9 +313,32 @@ void fixHud() {
         .tag = __func__,
         .signature = "F3 0F 11 73 58    48 8B 84 24 00 01 00 00",
     };
+    Utils::SignatureHook hook7 {
+        .tag = __func__,
+        .signature = "0F 59 07    F3 0F 11 44 24 20",
+    };
+    Utils::SignatureHook hook8 {
+        .tag = __func__,
+        .signature = "0F 57 F6    8B C0    F3 48 0F 2A F0    F3 41 0F 5E F1    F3 0F 59 35 ?? ?? ?? ??    E8 ?? ?? ?? ??    F3 44 0F 10 05 ?? ?? ?? ??",
+    };
 
     bool enable = yml.masterEnable & yml.fix.hud.enable;
     LOG("Fix {}", enable ? "Enabled" : "Disabled");
+
+    static bool resetTimer{false};
+    static std::mutex mtx;
+    static std::condition_variable cv;
+
+    std::thread([&]() {
+        std::unique_lock<std::mutex> lock(mtx);
+        while (true) {
+            resetTimer = false;
+            if (cv.wait_for(lock, std::chrono::milliseconds(100), [&] { return resetTimer; }) == false) {
+                isCostumeView.store(false);
+            }
+        }
+    }).detach();
+
     Utils::injectHook(enable, module, hook1,
         [](SafetyHookContext& ctx) {
             f32 normalizedHalfWidth = 1.0f / (static_cast<f32>(yml.resolution.width) / 2.0f);
@@ -312,8 +346,18 @@ void fixHud() {
             if (ctx.xmm0.f32[0] == normalizedHalfWidth && ctx.xmm0.f32[1] == normalizedHalfHeight) {
                 f32 normalizedWidth = 1.0f / static_cast<f32>(yml.resolution.width);
                 if (*reinterpret_cast<u32*>(ctx.rdx + 0x10) == 0x3F800000 && *reinterpret_cast<u32*>(ctx.rsp + 0x20) != 0 && (ctx.xmm2.f32[0] != normalizedWidth)) {
+                    if (isCostumeView.load() == true) {
+                        if (ctx.xmm3.f32[0] != static_cast<f32>(yml.resolution.width)) {
+                            return;
+                        }
+                        else if (ctx.xmm3.f32[0] == static_cast<f32>(yml.resolution.width)) {
+                            if (*reinterpret_cast<u64*>(ctx.rsp + 0x08) == 0 || *reinterpret_cast<f32*>(ctx.rsp + 0xFC) == static_cast<f32>(yml.resolution.height)) {
+                                return;
+                            }
+                        }
+                    }
                     f32 scaler = static_cast<f32>(yml.resolution.aspectRatio) / static_cast<f32>(nativeAspectRatio);
-                    ctx.xmm0.f32[0] = 2.0f / static_cast<f32>(yml.resolution.width * scaler);
+                    ctx.xmm0.f32[0] = 2.0f / (static_cast<f32>(yml.resolution.width) * scaler);
                     ctx.xmm0.f32[2] = -1.0f / scaler;
                 }
             }
@@ -444,6 +488,122 @@ void fixHud() {
             }
         }
     );
+    Utils::injectHook(enable, module, hook7,
+        [](SafetyHookContext& ctx) {
+            ctx.xmm0.f32[0] = static_cast<f32>(yml.resolution.width) / (1280.0f * (yml.resolution.aspectRatio / nativeAspectRatio));
+        }
+    );
+    Utils::injectHook(enable, module, hook8,
+        [](SafetyHookContext& ctx) {
+            ctx.xmm9.f32[0] = 1280.0f * (yml.resolution.aspectRatio / nativeAspectRatio);
+            isCostumeView.store(true);
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                resetTimer = true;
+            }
+            cv.notify_one();
+        }
+    );
+}
+
+/**
+ * @brief Fixes the cutscenes.
+ *
+ * @details
+ * This function injects 3 hooks which all work together to fix the cutscenes by making them render at the
+ * correct aspect ratio and not be stretched. This also fixes the squished rendering of 3D models when viewing
+ * costumes. Note that this doesn't fix that issue entirely, but at least they won't be horizontally squished
+ * anymore. All in all this is needed because the cutscenes being squished are a side effect of both the
+ * resolution and HUD fixes.
+ *
+ * How was this found?
+ * This was relatively simple to find, albeit understanding the problem why this could be happening took longer.
+ * But eventually I landed on the idea what happens if I just change the aspect ratio which the game is using
+ * and viola unstretched cutscenes. From there I really just needed to figure out where I can hook in a flag
+ * that will tell me if I am in a cutscene or not.
+ *
+ * I know that this game heavily relies on using 1280.0f and 720.0f for basically all of its calculations,
+ * so I needed to find a place in the code where this value is being read only when we are in a cutscene, or
+ * more trivially not in gameplay. Using Cheat Engine I had it track each access to the 1280.0f value and
+ * I was looking for a hit that is only accessed by gameplay, which there were plenty of, and I picked one
+ * more or less at random as it doesn't really matter. This is what hook2 accomplishes.
+ *
+ * Finding the aspect ratio was also simple, scan for my monitors aspect ratio so 32:9 and start changing
+ * values and eventually one did stick and I traced it down to some code which used it and whenever the
+ * `inCutscene` flag is set I would return the native aspect ratio instead of the actual aspect ratio, and
+ * with that cutscenes would be unsquished. This is what hook1 accomplishes.
+ *
+ * @return void
+ */
+void fixCutscenes() {
+    Utils::SignatureHook hook1 {
+        .tag = __func__,
+        .signature = "41 8B E8    8B F2    48 8B D9    E8 ?? ?? ?? ??",
+    };
+    Utils::SignatureHook hook2 {
+        .tag = __func__,
+        .signature = "0F 57 C0    F3 44 0F 10 B4 24 ?? ?? ?? ??    F3 44 0F 10 BC 24 ?? ?? ?? ??",
+    };
+    bool enable = yml.masterEnable & yml.fix.hud.enable;
+    LOG("Fix {}", enable ? "Enabled" : "Disabled");
+
+    static bool resetTimer{false};
+    static std::mutex mtx;
+    static std::condition_variable cv;
+
+    std::thread([&]() {
+        std::unique_lock<std::mutex> lock(mtx);
+        while (true) {
+            resetTimer = false;
+            if (cv.wait_for(lock, std::chrono::milliseconds(1000), [&] { return resetTimer; }) == false) {
+                inCutscene.store(false);
+            }
+        }
+    }).detach();
+
+    Utils::injectHook(enable, module, hook1,
+        [](SafetyHookContext& ctx) {
+            if (inCutscene.load() == true || isCostumeView.load() == true) {
+                ctx.xmm1.f32[0] = nativeAspectRatio;
+            }
+        }
+    );
+    Utils::injectHook(enable, module, hook2,
+        [](SafetyHookContext& ctx) {
+            inCutscene.store(true);
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                resetTimer = true;
+            }
+            cv.notify_one();
+        }
+    );
+}
+
+// WIP - Users report fullscreen is broken in the game, it is unclear what they mean
+void fixFullscreen() {
+    Utils::SignatureHook hook {
+        .tag = __func__,
+        .signature = "0F 85 ?? ?? ?? ??    48 8B 0D ?? ?? ?? ??    E8 ?? ?? ?? ??    48 8B 15 ?? ?? ?? ??    E8 ?? ?? ?? ??",
+    };
+    bool enable = yml.masterEnable & yml.fix.hud.enable;
+    LOG("Fix {}", enable ? "Enabled" : "Disabled");
+    Utils::injectHook(enable, module, hook,
+        [](SafetyHookContext& ctx) {
+            HWND hwnd = reinterpret_cast<HWND>(ctx.rcx);
+            MONITORINFO mi = { sizeof(mi) };
+            GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+            SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                mi.rcMonitor.left,
+                mi.rcMonitor.top,
+                mi.rcMonitor.right - mi.rcMonitor.left,
+                mi.rcMonitor.bottom - mi.rcMonitor.top,
+                SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_NOZORDER
+            );
+        }
+    );
 }
 
 /**
@@ -460,6 +620,7 @@ DWORD WINAPI Main(void* lpParameter) {
     readYml();
     fixResolution();
     fixHud();
+    fixCutscenes();
     logClose();
     return true;
 }
