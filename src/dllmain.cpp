@@ -55,15 +55,16 @@ typedef struct hud_t {
     bool enable;
 } hud_t;
 
-typedef struct fixes_t {
-    hud_t hud;
-} fixes_t;
+typedef struct fullscreen_t {
+    bool enable;
+} fullscreen_t;
 
 typedef struct yml_t {
     std::string name;
     bool masterEnable;
     resolution_t resolution;
-    fixes_t fix;
+    fullscreen_t fullscreen;
+    hud_t hud;
 } yml_t;
 
 // Globals
@@ -138,7 +139,9 @@ void readYml() {
     yml.resolution.width = config["resolution"]["width"].as<u32>();
     yml.resolution.height = config["resolution"]["height"].as<u32>();
 
-    yml.fix.hud.enable = config["fixes"]["hud"]["enable"].as<bool>();
+    yml.fullscreen.enable = config["fullscreen"]["enable"].as<bool>();
+
+    yml.hud.enable = config["hud"]["enable"].as<bool>();
 
     if (yml.resolution.width == 0 || yml.resolution.height == 0) {
         std::pair<int, int> dimensions = Utils::getDesktopDimensions();
@@ -159,6 +162,10 @@ void readYml() {
     LOG("Normalized Width: {}", nativeWidth);
     LOG("Normalized Offset: {}", nativeOffset);
     LOG("Width Scaling Factor: {}", widthScalingFactor);
+    LOG("-------------------------------------");
+    LOG("Fullscreen.Enable: {}", yml.fullscreen.enable);
+    LOG("HUD.Enable: {}", yml.hud.enable);
+    LOG("-------------------------------------");
 }
 
 /**
@@ -202,7 +209,7 @@ void fixResolution() {
         .patch = entry
     };
 
-    bool enable = yml.masterEnable & yml.fix.hud.enable;
+    bool enable = yml.masterEnable;
     LOG("Fix {}", enable ? "Enabled" : "Disabled");
     Utils::injectPatch(enable, module, patch1);
 }
@@ -321,8 +328,16 @@ void fixHud() {
         .tag = __func__,
         .signature = "0F 57 F6    8B C0    F3 48 0F 2A F0    F3 41 0F 5E F1    F3 0F 59 35 ?? ?? ?? ??    E8 ?? ?? ?? ??    F3 44 0F 10 05 ?? ?? ?? ??",
     };
+    Utils::SignatureHook hook9 {
+        .tag = __func__,
+        .signature = "F3 0F 59 47 08    F3 0F 11 44 24 28",
+    };
+    Utils::SignatureHook hook10 {
+        .tag = __func__,
+        .signature = "48 8D 15 ?? ?? ?? ??    48 8B CB    E8 ?? ?? ?? ??    80 BB ?? ?? ?? ?? 01",
+    };
 
-    bool enable = yml.masterEnable & yml.fix.hud.enable;
+    bool enable = yml.masterEnable & yml.hud.enable;
     LOG("Fix {}", enable ? "Enabled" : "Disabled");
 
     static bool resetTimer{false};
@@ -333,7 +348,7 @@ void fixHud() {
         std::unique_lock<std::mutex> lock(mtx);
         while (true) {
             resetTimer = false;
-            if (cv.wait_for(lock, std::chrono::milliseconds(100), [&] { return resetTimer; }) == false) {
+            if (cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return resetTimer; }) == false) {
                 isCostumeView.store(false);
             }
         }
@@ -496,6 +511,15 @@ void fixHud() {
     Utils::injectHook(enable, module, hook8,
         [](SafetyHookContext& ctx) {
             ctx.xmm9.f32[0] = 1280.0f * (yml.resolution.aspectRatio / nativeAspectRatio);
+        }
+    );
+    Utils::injectHook(enable, module, hook9,
+        [](SafetyHookContext& ctx) {
+            ctx.xmm0.f32[0] = 1280.0f / (yml.resolution.aspectRatio / nativeAspectRatio);
+        }
+    );
+    Utils::injectHook(enable, module, hook10,
+        [](SafetyHookContext& ctx) {
             isCostumeView.store(true);
             {
                 std::lock_guard<std::mutex> lock(mtx);
@@ -522,16 +546,11 @@ void fixHud() {
  * and viola unstretched cutscenes. From there I really just needed to figure out where I can hook in a flag
  * that will tell me if I am in a cutscene or not.
  *
- * I know that this game heavily relies on using 1280.0f and 720.0f for basically all of its calculations,
- * so I needed to find a place in the code where this value is being read only when we are in a cutscene, or
- * more trivially not in gameplay. Using Cheat Engine I had it track each access to the 1280.0f value and
- * I was looking for a hit that is only accessed by gameplay, which there were plenty of, and I picked one
- * more or less at random as it doesn't really matter. This is what hook2 accomplishes.
- *
- * Finding the aspect ratio was also simple, scan for my monitors aspect ratio so 32:9 and start changing
- * values and eventually one did stick and I traced it down to some code which used it and whenever the
- * `inCutscene` flag is set I would return the native aspect ratio instead of the actual aspect ratio, and
- * with that cutscenes would be unsquished. This is what hook1 accomplishes.
+ * The game has the string `INPUT_SCENE` hardcoded into the binary twice. I breakpointed all instances of it
+ * and found that this string does get accessed the game during cutscenes. The peice(s) of code that accesses this
+ * string depend on what type of cutscene is playing, a prerendered cutscene does not access this string the same
+ * amount of times and in the same places as an in engine cutscene would. So the hooking location should be where
+ * in engine cutscenes access this string. This is where hook2 is placed which will set the cutscene flag.
  *
  * @return void
  */
@@ -542,9 +561,9 @@ void fixCutscenes() {
     };
     Utils::SignatureHook hook2 {
         .tag = __func__,
-        .signature = "0F 57 C0    F3 44 0F 10 B4 24 ?? ?? ?? ??    F3 44 0F 10 BC 24 ?? ?? ?? ??",
+        .signature = "48 8D 0D ?? ?? ?? ??    4D 8B F8    4C 8B F2",
     };
-    bool enable = yml.masterEnable & yml.fix.hud.enable;
+    bool enable = yml.masterEnable & yml.hud.enable;
     LOG("Fix {}", enable ? "Enabled" : "Disabled");
 
     static bool resetTimer{false};
@@ -555,7 +574,7 @@ void fixCutscenes() {
         std::unique_lock<std::mutex> lock(mtx);
         while (true) {
             resetTimer = false;
-            if (cv.wait_for(lock, std::chrono::milliseconds(1000), [&] { return resetTimer; }) == false) {
+            if (cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return resetTimer; }) == false) {
                 inCutscene.store(false);
             }
         }
@@ -580,28 +599,81 @@ void fixCutscenes() {
     );
 }
 
-// WIP - Users report fullscreen is broken in the game, it is unclear what they mean
+/**
+ * @brief Forces borderless fullscreen.
+ *
+ * @details
+ * When the game is run on a 21:9 monitor, the game refuses to let you go into fullscreen mode for whatever
+ * reason. In the options you are unable to select fullscreen at all. This function forces the game to go
+ * into borderless fullscreen.
+ *
+ * How was this found?
+ * Windows has multiple window APIs that work together that let you play around with windows and how they
+ * behave. In the game code we need to look for calls to the following functions:
+ *  - SetWindowLongA
+ *  - SetWindowPos
+ *
+ * There are a few others, but these are the big ones for this x64 game, x86 is a bit different as well.
+ *
+ * Anyway, we looked for these calls and basically I needed to first hook into all of them to see the
+ * order that they are called and whichever the last one was that is the correct hook point, which turned
+ * out to be a call to `SetWindowPos`.
+ *
+ * So before we can even hook first that needed to be done was that call needed to be patched out so we
+ * preserve the window handle stored in RCX register rather than it being overwritten by some instruction
+ * in that call. Post patch we can hook at that location now and we have a valid window handle and we can
+ * start making all the right calls to force the game into borderless fullscreen.
+ *
+ * @return void
+ */
 void fixFullscreen() {
-    Utils::SignatureHook hook {
+    Utils::SignaturePatch patch1 {
         .tag = __func__,
-        .signature = "0F 85 ?? ?? ?? ??    48 8B 0D ?? ?? ?? ??    E8 ?? ?? ?? ??    48 8B 15 ?? ?? ?? ??    E8 ?? ?? ?? ??",
+        .signature = "FF 15 ?? ?? ?? ??    48 8B 7C 24 68    48 8B 5C 24 70    48 8B 4C 24 50",
+        .patch = "90 90 90 90 90 90"
     };
-    bool enable = yml.masterEnable & yml.fix.hud.enable;
+    Utils::SignatureHook hook1 {
+        .tag = __func__,
+        .signature = "48 8B 7C 24 68    48 8B 5C 24 70    48 8B 4C 24 50",
+    };
+
+    bool enable = yml.masterEnable & yml.fullscreen.enable;
     LOG("Fix {}", enable ? "Enabled" : "Disabled");
-    Utils::injectHook(enable, module, hook,
+    Utils::injectPatch(enable, module, patch1);
+    Utils::injectHook(enable, module, hook1,
         [](SafetyHookContext& ctx) {
-            HWND hwnd = reinterpret_cast<HWND>(ctx.rcx);
+            HWND hWnd = reinterpret_cast<HWND>(ctx.rcx);
+
+            // 1. Get current styles
+            LONG style = GetWindowLongA(hWnd, GWL_STYLE);
+            LONG exStyle = GetWindowLongA(hWnd, GWL_EXSTYLE);
+
+            // 2. Strip normal window chrome (title bar, borders, resize frame, sysmenu)
+            style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZE | WS_MAXIMIZE | WS_SYSMENU);
+            // 3. Make it a popup-style window (borderless)
+            style |= WS_POPUP;
+
+            // 4. Strip some extended edges
+            exStyle &= ~(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE | WS_EX_OVERLAPPEDWINDOW);
+
+            // 5. Apply new styles
+            SetWindowLongA(hWnd, GWL_STYLE, style);
+            SetWindowLongA(hWnd, GWL_EXSTYLE, exStyle);
+
+            // 6. Tell Windows the frame has changed so it recalculates non-client area
+            SetWindowPos(hWnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+
+            // 7. Get the monitor info to know the correct dimensions for fullscreen
+            HMONITOR mon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
             MONITORINFO mi = { sizeof(mi) };
-            GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
-            SetWindowPos(
-                hwnd,
-                HWND_TOP,
-                mi.rcMonitor.left,
-                mi.rcMonitor.top,
-                mi.rcMonitor.right - mi.rcMonitor.left,
-                mi.rcMonitor.bottom - mi.rcMonitor.top,
-                SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_NOZORDER
-            );
+            GetMonitorInfoA(mon, &mi);
+            int x = mi.rcMonitor.left;
+            int y = mi.rcMonitor.top;
+            int w = mi.rcMonitor.right - mi.rcMonitor.left;
+            int h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+
+            // 8. Resize and show the window to cover the entire monitor
+            SetWindowPos(hWnd, HWND_TOP, x, y, w, h, SWP_SHOWWINDOW);
         }
     );
 }
@@ -621,6 +693,7 @@ DWORD WINAPI Main(void* lpParameter) {
     fixResolution();
     fixHud();
     fixCutscenes();
+    fixFullscreen();
     logClose();
     return true;
 }

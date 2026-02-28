@@ -9,9 +9,10 @@ resolution:
   width: 0
   height: 0
 
-# Available fixes
-fixes:
+# Forces the game to run in borderless fullscreen.
+fullscreen:
+  enable: true
 
-  # Unstretches, constrains, and centers the HUD and movies to 16:9.
-  hud:
-    enable: true
+# Unstretches, constrains, and centers the HUD and movies to 16:9.
+hud:
+  enable: true
