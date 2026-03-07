@@ -293,7 +293,7 @@ void fixResolution() {
 void fixHud() {
     static bool isHealthBarTrack = false;
     static bool isHealthBarFill = false;
-    static u64 healthBarTrackX = 0;
+    static f32 healthBarTrackX = 0;
     static bool glpyhStringEnd = false;
     static std::vector<u64> glyphString{};
     Utils::SignatureHook hook1 {
