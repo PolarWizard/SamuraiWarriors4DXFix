@@ -80,7 +80,8 @@ namespace {
     yml_t yml{};
 
     std::atomic<bool> isCostumeView{false};
-    std::atomic<bool> inCutscene{false};
+    std::atomic<bool> isCutscene{false};
+    std::atomic<bool> isGameplay{false};
 }
 
 /**
@@ -563,38 +564,67 @@ void fixCutscenes() {
         .tag = __func__,
         .signature = "48 8D 0D ?? ?? ?? ??    4D 8B F8    4C 8B F2",
     };
+    Utils::SignatureHook hook3 {
+        .tag = __func__,
+        .signature = "F3 44 0F 5E 0D ?? ?? ?? ??    F3 44 0F 59 8C 24 38 01 00 00",
+    };
+
     bool enable = yml.masterEnable & yml.hud.enable;
     LOG("Fix {}", enable ? "Enabled" : "Disabled");
 
-    static bool resetTimer{false};
-    static std::mutex mtx;
-    static std::condition_variable cv;
+    static bool resetTimer1{false};
+    static std::mutex mtx1;
+    static std::condition_variable cv1;
+    static bool resetTimer2{false};
+    static std::mutex mtx2;
+    static std::condition_variable cv2;
 
     std::thread([&]() {
-        std::unique_lock<std::mutex> lock(mtx);
+        std::unique_lock<std::mutex> lock(mtx1);
         while (true) {
-            resetTimer = false;
-            if (cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return resetTimer; }) == false) {
-                inCutscene.store(false);
+            resetTimer1 = false;
+            if (cv1.wait_for(lock, std::chrono::milliseconds(20), [&] { return resetTimer1; }) == false) {
+                isCutscene.store(false);
+            }
+        }
+    }).detach();
+    std::thread([&]() {
+        std::unique_lock<std::mutex> lock(mtx2);
+        while (true) {
+            resetTimer2 = false;
+            if (cv2.wait_for(lock, std::chrono::milliseconds(20), [&] { return resetTimer2; }) == false) {
+                isGameplay.store(false);
             }
         }
     }).detach();
 
     Utils::injectHook(enable, module, hook1,
         [](SafetyHookContext& ctx) {
-            if (inCutscene.load() == true || isCostumeView.load() == true) {
-                ctx.xmm1.f32[0] = nativeAspectRatio;
+            if (isGameplay.load() == false) {
+                if (isCutscene.load() == true || isCostumeView.load() == true) {
+                    ctx.xmm1.f32[0] = nativeAspectRatio;
+                }
             }
         }
     );
     Utils::injectHook(enable, module, hook2,
         [](SafetyHookContext& ctx) {
-            inCutscene.store(true);
+            isCutscene.store(true);
             {
-                std::lock_guard<std::mutex> lock(mtx);
-                resetTimer = true;
+                std::lock_guard<std::mutex> lock(mtx1);
+                resetTimer1 = true;
             }
-            cv.notify_one();
+            cv1.notify_one();
+        }
+    );
+    Utils::injectHook(enable, module, hook3,
+        [](SafetyHookContext& ctx) {
+            isGameplay.store(true);
+            {
+                std::lock_guard<std::mutex> lock(mtx2);
+                resetTimer2 = true;
+            }
+            cv2.notify_one();
         }
     );
 }
